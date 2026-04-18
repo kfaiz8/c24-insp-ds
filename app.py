@@ -84,36 +84,109 @@ METRIC_LABELS = {
 }
 
 # ----------------------------------------------------------------
+# PARQUET MAGIC-BYTE VALIDATOR
+# ----------------------------------------------------------------
+_PARQUET_MAGIC = b"PAR1"
+
+
+def _is_valid_parquet(path: Path) -> bool:
+    """
+    Return True only if the file exists, is non-empty, and starts / ends
+    with the Parquet magic bytes 'PAR1'.  A corrupt or partial download
+    (e.g. an HTML error page from Google Drive) will fail this check.
+    """
+    try:
+        size = path.stat().st_size
+        if size < 8:
+            return False
+        with open(path, "rb") as fh:
+            header = fh.read(4)
+            fh.seek(-4, 2)          # 4 bytes from the end
+            footer = fh.read(4)
+        return header == _PARQUET_MAGIC and footer == _PARQUET_MAGIC
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------
 # DATA SOURCE CONFIGURATION
 #
 # HOW IT WORKS:
-#   1. Locally  -> reads data/Insp-ds-qc.parquet  (run convert_to_parquet.py first)
+#   1. Locally  -> reads data/Insp-ds-qc.parquet
 #   2. Deployed -> downloads from Google Drive using GDRIVE_FILE_ID secret,
-#                  caches the parquet file to /tmp so it is only downloaded
-#                  once per container restart.
+#                  caches to /tmp.  Uses gdown for reliable large-file
+#                  downloads (handles the virus-scan confirmation page
+#                  automatically).
 #
 # SETUP (one time):
-#   * Run convert_to_parquet.py on your machine to create the .parquet file
-#   * Upload that file to Google Drive and copy its file ID
-#   * In Streamlit Cloud -> App settings -> Secrets, add:
+#   * Run convert_to_parquet.py to create the .parquet file
+#   * Upload to Google Drive, copy the file ID
+#   * Streamlit Cloud -> App settings -> Secrets:
 #       GDRIVE_FILE_ID = "YOUR_GOOGLE_DRIVE_FILE_ID_HERE"
+#
+# requirements.txt must include:
+#   gdown>=5.1.0
 # ----------------------------------------------------------------
 LOCAL_PARQUET = Path("data/Insp-ds-qc.parquet")
 GDRIVE_CACHE  = Path("/tmp/Insp-ds-qc.parquet")
 
 
+def _download_from_gdrive(file_id: str, dest: Path) -> None:
+    """
+    Download a Google Drive file to *dest* using gdown.
+    gdown handles large-file virus-scan confirmation pages automatically
+    and is far more reliable than a raw requests approach.
+    """
+    try:
+        import gdown
+    except ImportError:
+        st.error(
+            "`gdown` is not installed.  Add `gdown>=5.1.0` to requirements.txt "
+            "and redeploy."
+        )
+        st.stop()
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    url = f"https://drive.google.com/uc?id={file_id}"
+
+    with st.spinner("Downloading dataset from Google Drive (one-time, ~30 s)…"):
+        gdown.download(url, str(dest), quiet=False, fuzzy=True)
+
+
 def _get_parquet_path() -> Path:
     """
-    Return path to parquet file.
-    Locally: use LOCAL_PARQUET.
-    Deployed: download from Google Drive into /tmp if not already cached.
+    Return path to a *valid* parquet file.
+
+    Priority:
+      1. Local file (development)
+      2. Valid cached file in /tmp  (deployed, already downloaded)
+      3. Download from Google Drive, validate, then return /tmp path
+
+    If the cached file exists but is corrupt (e.g. a partial / HTML
+    download from a previous run) it is deleted and re-downloaded.
     """
+    # ── 1. Local dev path ──────────────────────────────────────────
     if LOCAL_PARQUET.exists():
+        if not _is_valid_parquet(LOCAL_PARQUET):
+            st.error(
+                f"`{LOCAL_PARQUET}` exists but is **not a valid Parquet file**.\n\n"
+                "Re-run `python convert_to_parquet.py` to regenerate it."
+            )
+            st.stop()
         return LOCAL_PARQUET
 
+    # ── 2. Valid cached file ────────────────────────────────────────
     if GDRIVE_CACHE.exists():
-        return GDRIVE_CACHE
+        if _is_valid_parquet(GDRIVE_CACHE):
+            return GDRIVE_CACHE
+        # Corrupt cache — delete and fall through to re-download
+        st.warning(
+            "Cached data file is corrupt (possibly a failed previous download). "
+            "Re-downloading from Google Drive…"
+        )
+        GDRIVE_CACHE.unlink(missing_ok=True)
 
+    # ── 3. Download from Google Drive ──────────────────────────────
     file_id = st.secrets.get("GDRIVE_FILE_ID", "")
     if not file_id:
         st.error(
@@ -125,29 +198,20 @@ def _get_parquet_path() -> Path:
         )
         st.stop()
 
-    import requests
+    _download_from_gdrive(file_id, GDRIVE_CACHE)
 
-    download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-
-    with st.spinner("Downloading dataset from Google Drive (one-time, ~30 s)..."):
-        session  = requests.Session()
-        response = session.get(download_url, stream=True)
-
-        # Large files go through a virus-scan warning page; extract confirm token
-        token = None
-        for key, value in response.cookies.items():
-            if key.startswith("download_warning"):
-                token = value
-                break
-
-        if token:
-            response = session.get(download_url, params={"confirm": token}, stream=True)
-
-        GDRIVE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        with open(GDRIVE_CACHE, "wb") as fh:
-            for chunk in response.iter_content(chunk_size=8 * 1024 * 1024):
-                if chunk:
-                    fh.write(chunk)
+    # Validate the freshly downloaded file
+    if not _is_valid_parquet(GDRIVE_CACHE):
+        GDRIVE_CACHE.unlink(missing_ok=True)
+        st.error(
+            "The file downloaded from Google Drive is **not a valid Parquet file**.\n\n"
+            "Possible causes:\n"
+            "- The Google Drive file ID is wrong or the file is not shared publicly.\n"
+            "- The file was not exported as Parquet (run `convert_to_parquet.py` "
+            "and re-upload).\n\n"
+            "Check the file ID in your Streamlit secrets and try again."
+        )
+        st.stop()
 
     return GDRIVE_CACHE
 
@@ -157,16 +221,41 @@ def _get_parquet_path() -> Path:
 # Parquet is ~5-10x smaller than CSV and loads ~10x faster.
 # All cleaning was done once in convert_to_parquet.py.
 # ----------------------------------------------------------------
-@st.cache_data(show_spinner="Loading data... (one-time)")
+@st.cache_data(show_spinner="Loading data… (one-time)")
 def load_data() -> pd.DataFrame:
     """Read parquet. All dirty-data cleaning was done in convert_to_parquet.py."""
     path = _get_parquet_path()
 
-    df = pd.read_parquet(
-        path,
-        columns=["APPOINTMENT_ID", "INSP_APP_FIELD", "DS_OUTPUT", "MONTH_LABEL"],
-        engine="pyarrow",
-    )
+    try:
+        df = pd.read_parquet(
+            path,
+            columns=["APPOINTMENT_ID", "INSP_APP_FIELD", "DS_OUTPUT", "MONTH_LABEL"],
+            engine="pyarrow",
+        )
+    except Exception as primary_err:
+        # ── Fallback 1: try fastparquet ─────────────────────────────
+        try:
+            df = pd.read_parquet(
+                path,
+                columns=["APPOINTMENT_ID", "INSP_APP_FIELD", "DS_OUTPUT", "MONTH_LABEL"],
+                engine="fastparquet",
+            )
+        except Exception:
+            # ── Fallback 2: corrupt cache — nuke & force re-download ─
+            if path == GDRIVE_CACHE:
+                GDRIVE_CACHE.unlink(missing_ok=True)
+                st.error(
+                    f"Failed to read the Parquet file with both pyarrow and "
+                    f"fastparquet.\n\nOriginal error: `{primary_err}`\n\n"
+                    "The corrupt cached file has been deleted. "
+                    "**Please reload the page** to trigger a fresh download."
+                )
+            else:
+                st.error(
+                    f"Cannot read `{path}`.\n\nError: `{primary_err}`\n\n"
+                    "Re-run `python convert_to_parquet.py` to regenerate the file."
+                )
+            st.stop()
 
     # Re-apply ordered categorical (parquet preserves dtype but not ordered flag
     # across all pandas versions)
