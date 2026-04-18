@@ -1,5 +1,8 @@
 streamlit>=1.35.0
 pandas>=2.2.0
 numpy>=1.26.0
-plotly>=5.22.0
 pyarrow>=16.0.0
+fastparquet>=2024.2.0
+plotly>=5.22.0
+gdown>=5.1.0
+requests>=2.31.0
